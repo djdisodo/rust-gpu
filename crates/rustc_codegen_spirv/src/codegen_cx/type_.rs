@@ -196,6 +196,7 @@ impl<'tcx> BaseTypeMethods<'tcx> for CodegenCx<'tcx> {
         // FIXME(eddyb) use `AccumulateVec`s just like `rustc` itself does.
         let (field_offsets, size, align) = crate::abi::auto_struct_layout(self, els);
         SpirvType::Adt {
+            is_enum: false,
             def_id: None,
             align,
             size,

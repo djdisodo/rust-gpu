@@ -8,21 +8,16 @@ use rspirv::spirv::{StorageClass, Word};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_errors::ErrorGuaranteed;
 use rustc_index::vec::Idx;
-use rustc_middle::ty::layout::{FnAbiOf, LayoutOf, TyAndLayout};
+use rustc_middle::ty::layout::{FnAbiOf, LayoutError, LayoutOf, TyAndLayout};
 use rustc_middle::ty::query::{ExternProviders, Providers};
 use rustc_middle::ty::subst::SubstsRef;
-use rustc_middle::ty::{
-    self, Const, FloatTy, GeneratorSubsts, IntTy, ParamEnv, PolyFnSig, Ty, TyCtxt, TyKind,
-    TypeAndMut, UintTy,
-};
+use rustc_middle::ty::{self, AdtDef, Const, FloatTy, GeneratorSubsts, IntTy, ParamEnv, PolyFnSig, Ty, TyCtxt, TyKind, TypeAndMut, UintTy, VariantDef};
 use rustc_middle::{bug, span_bug};
 use rustc_span::def_id::DefId;
 use rustc_span::DUMMY_SP;
 use rustc_span::{Span, Symbol};
 use rustc_target::abi::call::{ArgAbi, ArgAttributes, FnAbi, PassMode};
-use rustc_target::abi::{
-    Abi, Align, FieldsShape, LayoutS, Primitive, Scalar, Size, TagEncoding, VariantIdx, Variants,
-};
+use rustc_target::abi::{Abi, Align, FieldsShape, LayoutS, Primitive, Scalar, Size, TagEncoding, VariantIdx, Variants};
 use rustc_target::spec::abi::Abi as SpecAbi;
 use std::cell::RefCell;
 use std::collections::hash_map::Entry;
@@ -151,21 +146,193 @@ pub(crate) fn provide(providers: &mut Providers) {
         let TyAndLayout { ty, mut layout } =
             (rustc_interface::DEFAULT_QUERY_PROVIDERS.layout_of)(tcx, key)?;
 
-        #[allow(clippy::match_like_matches_macro)]
-        let hide_niche = match ty.kind() {
-            ty::Bool => true,
-            _ => false,
-        };
-
-        if hide_niche {
-            layout = tcx.intern_layout(LayoutS {
-                largest_niche: None,
-                ..clone_layout(layout.0 .0)
-            });
+        match (&layout.0.0.variants, &layout.0.0.abi, &layout.0.0.fields, ty.kind()) {
+            (
+                Variants::Multiple { .. },
+                Abi::Aggregate { .. },
+                &FieldsShape::Arbitrary { .. },
+                TyKind::Adt(def, substs),
+            ) => {
+                let mut our_layout = clone_layout(layout.0.0);
+                deoverlay_enum_fields(tcx, ty, key.param_env, def, substs, &mut our_layout)?;
+                layout = tcx.intern_layout(our_layout);
+            }
+            (_, _, _, ty::Bool) => {
+                layout = tcx.intern_layout(LayoutS {
+                    largest_niche: None,
+                    ..clone_layout(layout.0.0)
+                });
+            }
+            _ => {}
         }
 
         Ok(TyAndLayout { ty, layout })
     };
+}
+
+fn deoverlay_enum_fields<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: Ty<'tcx>,
+    param_env: ParamEnv<'tcx>,
+    def: &AdtDef<'_>,
+    substs: SubstsRef<'tcx>,
+    layout: &mut LayoutS<VariantIdx>,
+) -> Result<(), LayoutError<'tcx>> {
+    if let Variants::Multiple {
+        ref tag_encoding,
+        ref mut variants,
+        ..
+    } = layout.variants
+    {
+        let mut niche = match tag_encoding {
+
+            TagEncoding::Niche {
+                untagged_variant, ..
+            } => Some((*untagged_variant, layout.fields.offset(0))),
+
+            TagEncoding::Direct => {
+                assert_eq!(Size::ZERO, layout.fields.offset(0));
+                None
+            }
+        };
+
+        let mut field_cache = vec![];
+
+        for (index, variant_layout) in variants.iter_enumerated_mut() {
+            #[allow(clippy::map_err_ignore)]
+            deoverlay_variant(
+                tcx,
+                param_env,
+                &def.variants()[index],
+                substs,
+                &mut field_cache,
+                index,
+                variant_layout,
+                &mut layout.size,
+                &mut niche,
+                def.repr().c(),
+            )
+                .map_err(|_| LayoutError::Unknown(ty))?;
+        }
+
+        if let Some((_, offset)) = niche {
+            if let FieldsShape::Arbitrary {
+                ref mut offsets, ..
+            } = layout.fields
+            {
+                offsets[0] = offset;
+            } else {
+                bug!();
+            }
+        }
+    } else {
+        bug!();
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deoverlay_variant<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    param_env: ParamEnv<'tcx>,
+    def: &VariantDef,
+    substs: SubstsRef<'tcx>,
+    field_cache: &mut Vec<(Size, VariantIdx, TyAndLayout<'tcx>)>,
+    index: VariantIdx,
+    layout: &mut LayoutS<VariantIdx>,
+    size: &mut Size,
+    niche: &mut Option<(VariantIdx, Size)>,
+    is_c: bool,
+) -> Result<(), ()> {
+    let find_field_by_offset_or_type =
+        |offset, ty, field_cache: &mut Vec<(Size, VariantIdx, TyAndLayout<'tcx>)>, dry: bool| {
+            match field_cache[..].binary_search_by(|&(foff, _, _)| foff.cmp(&offset)) {
+                Ok(idx) => {
+                    if field_cache[idx].2 == ty && field_cache[idx].1 != index {
+                        return Some(offset);
+                    }
+                }
+                Err(idx) => {
+                    let prev_fits =
+                        idx == 0 || field_cache[idx - 1].0 + field_cache[idx - 1].2.size <= offset;
+                    let next_fits =
+                        idx == field_cache.len() || field_cache[idx].0 >= offset + ty.size;
+                    if prev_fits && next_fits {
+                        if !dry {
+                            field_cache.insert(idx, (offset, index, ty));
+                        }
+                        return Some(offset);
+                    }
+                }
+            }
+            if !is_c {
+                if let Some((offset, _, _)) = field_cache
+                    .iter()
+                    .find(|&(_, varidx, otherty)| *varidx != index && *otherty == ty)
+                {
+                    return Some(*offset);
+                }
+            }
+            None
+        };
+    let mut add_at_end =
+        |i: usize,
+         ty: TyAndLayout<'tcx>,
+         field_cache: &mut Vec<(Size, VariantIdx, TyAndLayout<'tcx>)>| {
+            let offset = size.align_to(ty.align.abi);
+            if !is_c {
+                field_cache.push((offset, index, ty));
+                *size = offset + ty.size;
+                Ok(offset)
+            } else {
+                tcx.sess.span_err(
+                    tcx.def_span(def.fields[i].did),
+                    "Failed to make repr(C) layout: field overlaps a different data type",
+                );
+                Err(())
+            }
+        };
+    let mut find_or_add = |a, aofs, aty| {
+        find_field_by_offset_or_type(aofs, aty, field_cache, false)
+            .map_or_else(|| add_at_end(a, aty, field_cache), Ok)
+    };
+    let mut assign_and_check = |offset: &mut Size, newval| {
+        if Some((index, *offset)) == *niche {
+            *niche = Some((index, newval));
+        }
+        *offset = newval;
+    };
+    let (offsets, memory_index) = if let FieldsShape::Arbitrary {
+        ref mut offsets,
+        ref mut memory_index,
+    } = layout.fields
+    {
+        (offsets, memory_index)
+    } else {
+        bug!("univariant has FieldsShape: {:?}", layout.fields);
+    };
+    // ZST fields can happily live at whatever offset
+    let non_zst = (0..offsets.len())
+        .map(|i| (i, def.fields[i].ty(tcx, substs)))
+        .map(|(i, ty)| (i, tcx.layout_of(param_env.and(ty)).unwrap()))
+        .filter(|(_, ty)| !ty.is_zst());
+
+    match layout.abi {
+        // Apparently you're supposed to reserve space for non-ZST uninhabited fields
+        Abi::Aggregate { .. } => {
+            for (i, ty) in non_zst {
+                let newofs = find_or_add(i, offsets[i], ty)?;
+                assign_and_check(&mut offsets[i], newofs);
+            }
+            // rebuild memory_index
+            let mut new_memindex: Vec<_> = (0..offsets.len() as u32).collect();
+            new_memindex[..].sort_by_key(|i| offsets[*i as usize]);
+            *memory_index = new_memindex;
+        }
+        _ => bug!("non-Aggregate variant in Aggregate enum: {:?}", def),
+    }
+
+    Ok(())
 }
 
 pub(crate) fn provide_extern(providers: &mut ExternProviders) {
@@ -361,15 +528,11 @@ impl<'tcx> ConvSpirvType<'tcx> for TyAndLayout<'tcx> {
         // `ScalarPair`.
         // There's a few layers that we go through here. First we inspect layout.abi, then if relevant, layout.fields, etc.
         match self.abi {
-            Abi::Uninhabited => SpirvType::Adt {
-                def_id: def_id_for_spirv_type_adt(*self),
-                size: Some(Size::ZERO),
-                align: Align::from_bytes(0).unwrap(),
-                field_types: &[],
-                field_offsets: &[],
-                field_names: None,
-            }
-            .def_with_name(cx, span, TyLayoutNameKey::from(*self)),
+            Abi::Uninhabited => SpirvType::zst(def_id_for_spirv_type_adt(*self)).def_with_name(
+                cx,
+                span,
+                TyLayoutNameKey::from(*self),
+            ),
             Abi::Scalar(scalar) => trans_scalar(cx, span, *self, scalar, Size::ZERO),
             Abi::ScalarPair(a, b) => {
                 // NOTE(eddyb) unlike `Abi::Scalar`'s simpler newtype-unpacking
@@ -428,6 +591,7 @@ impl<'tcx> ConvSpirvType<'tcx> for TyAndLayout<'tcx> {
                     }
                 }
                 SpirvType::Adt {
+                    is_enum: false,
                     def_id: def_id_for_spirv_type_adt(*self),
                     size,
                     align: self.align.abi,
@@ -595,15 +759,11 @@ fn dig_scalar_pointee<'tcx>(
 
 fn trans_aggregate<'tcx>(cx: &CodegenCx<'tcx>, span: Span, ty: TyAndLayout<'tcx>) -> Word {
     fn create_zst<'tcx>(cx: &CodegenCx<'tcx>, span: Span, ty: TyAndLayout<'tcx>) -> Word {
-        SpirvType::Adt {
-            def_id: def_id_for_spirv_type_adt(ty),
-            size: Some(Size::ZERO),
-            align: Align::from_bytes(0).unwrap(),
-            field_types: &[],
-            field_offsets: &[],
-            field_names: None,
-        }
-        .def_with_name(cx, span, TyLayoutNameKey::from(ty))
+        SpirvType::zst(def_id_for_spirv_type_adt(ty)).def_with_name(
+            cx,
+            span,
+            TyLayoutNameKey::from(ty),
+        )
     }
     match ty.fields {
         FieldsShape::Primitive => span_bug!(
@@ -653,11 +813,78 @@ fn trans_aggregate<'tcx>(cx: &CodegenCx<'tcx>, span: Span, ty: TyAndLayout<'tcx>
                 .def(span, cx)
             }
         }
-        FieldsShape::Arbitrary {
-            offsets: _,
-            memory_index: _,
-        } => trans_struct(cx, span, ty),
+        FieldsShape::Arbitrary { .. } => {
+            if let (Variants::Multiple { .. }, TyKind::Adt(_, _)) = (&ty.variants, ty.ty.kind()) {
+                trans_enum(cx, span, ty)
+            } else {
+                trans_struct(cx, span, ty)
+            }
+        }
     }
+}
+
+fn trans_enum<'tcx>(cx: &CodegenCx<'tcx>, span: Span, ty: TyAndLayout<'tcx>) -> Word {
+    let (variants, tag) = if let Variants::Multiple {
+        ref variants,
+        ref tag,
+        ..
+    } = ty.variants
+    {
+        (variants, tag)
+    } else {
+        unreachable!();
+    };
+    let tag_offset = ty.fields.offset(0);
+    let mut field_cache = FxHashMap::default();
+    let mut field_offsets = vec![tag_offset];
+    field_cache.insert(
+        tag_offset,
+        (
+            Symbol::intern("discriminant"),
+            trans_scalar(cx, span, ty, *tag, tag_offset),
+        ),
+    );
+    let def = if let TyKind::Adt(ref def, _) = ty.ty.kind() {
+        def
+    } else {
+        unreachable!()
+    };
+
+    for index in variants.indices() {
+        let variant_ty = ty.for_variant(cx, index);
+        for field in 0..variant_ty.fields.count() {
+            let offset = variant_ty.fields.offset(field);
+            match field_cache.entry(offset) {
+                Entry::Vacant(entry) => {
+                    field_offsets.push(offset);
+                    entry.insert((
+                        def.variants()[index].fields[field].name,
+                        variant_ty.field(cx, field).spirv_type(span, cx),
+                    ));
+                }
+                Entry::Occupied(_) => {
+                    // FIXME(mobius): record additional names?
+                }
+            }
+        }
+    }
+    field_offsets[1..].sort();
+
+    let (field_names, field_types): (Vec<_>, Vec<_>) = field_offsets
+        .iter()
+        .map(|ofs| field_cache.remove(ofs).unwrap())
+        .unzip();
+
+    SpirvType::Adt {
+        is_enum: true,
+        def_id: def_id_for_spirv_type_adt(ty),
+        size: Some(ty.size),
+        align: ty.align.abi,
+        field_types: &field_types,
+        field_offsets: &field_offsets,
+        field_names: Some(&field_names),
+    }
+        .def_with_name(cx, span, TyLayoutNameKey::from(ty))
 }
 
 // returns (field_offsets, size, align)
@@ -694,32 +921,25 @@ fn trans_struct<'tcx>(cx: &CodegenCx<'tcx>, span: Span, ty: TyAndLayout<'tcx>) -
     let mut field_types = Vec::new();
     let mut field_offsets = Vec::new();
     let mut field_names = Vec::new();
+    let index = if let Variants::Single { index } = ty.variants {
+        index
+    } else {
+        unreachable!()
+    };
     for i in ty.fields.index_by_increasing_offset() {
         let field_ty = ty.field(cx, i);
         field_types.push(field_ty.spirv_type(span, cx));
         let offset = ty.fields.offset(i);
         field_offsets.push(offset);
-        if let Variants::Single { index } = ty.variants {
-            if let TyKind::Adt(adt, _) = ty.ty.kind() {
-                let field = &adt.variants()[index].fields[i];
-                field_names.push(field.name);
-            } else {
-                // FIXME(eddyb) this looks like something that should exist in rustc.
-                field_names.push(Symbol::intern(&format!("{i}")));
-            }
+        if let TyKind::Adt(adt, _) = ty.ty.kind() {
+            let field = &adt.variants()[index].fields[i];
+            field_names.push(field.name);
         } else {
-            if let TyKind::Adt(_, _) = ty.ty.kind() {
-            } else {
-                span_bug!(span, "Variants::Multiple not TyKind::Adt");
-            }
-            if i == 0 {
-                field_names.push(cx.sym.discriminant);
-            } else {
-                cx.tcx.sess.fatal("Variants::Multiple has multiple fields")
-            }
-        };
+            field_names.push(Symbol::intern(&format!("{i}")));
+        }
     }
     SpirvType::Adt {
+        is_enum: false,
         def_id: def_id_for_spirv_type_adt(ty),
         size,
         align,

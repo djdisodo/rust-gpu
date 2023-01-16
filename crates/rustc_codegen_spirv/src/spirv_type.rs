@@ -30,6 +30,7 @@ pub enum SpirvType<'tcx> {
     Float(u32),
     /// This uses the rustc definition of "adt", i.e. a struct, enum, or union
     Adt {
+        is_enum: bool,
         /// Not emitted into SPIR-V, but used to avoid too much deduplication,
         /// which could result in one SPIR-V `OpType*` having many names
         /// (not in itself an issue, but it makes error reporting harder).
@@ -38,6 +39,7 @@ pub enum SpirvType<'tcx> {
         align: Align,
         size: Option<Size>,
         field_types: &'tcx [Word],
+        /// In ascending order, with possible exception of first element, in case is_enum is true
         field_offsets: &'tcx [Size],
         field_names: Option<&'tcx [Symbol]>,
     },
@@ -88,6 +90,13 @@ pub enum SpirvType<'tcx> {
 
     AccelerationStructureKhr,
     RayQueryKhr,
+}
+/// ABI kind, categorizes valid bitcasts. TODO: should bools be included?
+#[derive(Eq, PartialEq, Copy, Clone, Debug)]
+pub enum AbiMemoryKind {
+    Pointer,
+    Numeric(Size),
+    Bool,
 }
 
 impl SpirvType<'_> {
@@ -147,6 +156,7 @@ impl SpirvType<'_> {
                 result
             }
             Self::Adt {
+                is_enum: _,
                 def_id: _,
                 align: _,
                 size: _,
@@ -383,6 +393,28 @@ impl SpirvType<'_> {
             Self::InterfaceBlock { inner_type } => cx.lookup_type(inner_type).alignof(cx),
         }
     }
+    pub fn zst(def_id: Option<DefId>) -> Self {
+        Self::Adt {
+            is_enum: false,
+            def_id,
+            size: Some(Size::ZERO),
+            align: Align::from_bytes(0).unwrap(),
+            field_types: &[],
+            field_offsets: &[],
+            field_names: None,
+        }
+    }
+
+    pub fn abi_kind<'tcx>(&self, cx: &CodegenCx<'tcx>) -> Option<AbiMemoryKind> {
+        match *self {
+            Self::Bool => Some(AbiMemoryKind::Bool),
+            Self::Integer(_, _) | Self::Float(_) | Self::Vector { .. } => {
+                Some(AbiMemoryKind::Numeric(self.sizeof(cx).unwrap()))
+            }
+            Self::Pointer { .. } => Some(AbiMemoryKind::Pointer),
+            _ => None,
+        }
+    }
 
     /// Replace `&[T]` fields with `&'tcx [T]` ones produced by calling
     /// `tcx.arena.dropless.alloc_slice(...)` - this is done late for two reasons:
@@ -436,6 +468,7 @@ impl SpirvType<'_> {
 
             // Only these variants have any slices to arena-allocate.
             SpirvType::Adt {
+                is_enum,
                 def_id,
                 align,
                 size,
@@ -443,6 +476,7 @@ impl SpirvType<'_> {
                 field_offsets,
                 field_names,
             } => SpirvType::Adt {
+                is_enum,
                 def_id,
                 align,
                 size,
@@ -465,6 +499,14 @@ impl<'a> SpirvType<'a> {
     /// Use this if you want a pretty type printing that recursively prints the types within (e.g. struct fields)
     pub fn debug<'tcx>(self, id: Word, cx: &'a CodegenCx<'tcx>) -> SpirvTypePrinter<'a, 'tcx> {
         SpirvTypePrinter { ty: self, id, cx }
+    }
+}
+
+impl AbiMemoryKind {
+    pub fn bitcast_compatible(self, other: Self) -> bool {
+        self == other
+            || self == Self::Bool && other == Self::Numeric(Size::from_bytes(1))
+            || self == Self::Numeric(Size::from_bytes(1)) && other == Self::Bool
     }
 }
 
@@ -504,6 +546,7 @@ impl fmt::Debug for SpirvTypePrinter<'_, '_> {
                 .field("width", &width)
                 .finish(),
             SpirvType::Adt {
+                is_enum,
                 def_id,
                 align,
                 size,
@@ -517,6 +560,7 @@ impl fmt::Debug for SpirvTypePrinter<'_, '_> {
                     .collect::<Vec<_>>();
                 f.debug_struct("Adt")
                     .field("id", &self.id)
+                    .field("is_enum", &is_enum)
                     .field("def_id", &def_id)
                     .field("align", &align)
                     .field("size", &size)
@@ -652,6 +696,7 @@ impl SpirvTypePrinter<'_, '_> {
             }
             SpirvType::Float(width) => write!(f, "f{width}"),
             SpirvType::Adt {
+                is_enum,
                 def_id: _,
                 align: _,
                 size: _,
@@ -659,7 +704,8 @@ impl SpirvTypePrinter<'_, '_> {
                 field_offsets: _,
                 ref field_names,
             } => {
-                write!(f, "struct")?;
+                // FIXME(mobius): it's useful bit of info, but kinda invalid Rust, should we care?
+                write!(f, "{}", if is_enum { "enum" } else { "struct" })?;
 
                 // HACK(eddyb) use the first name (in insertion order, i.e.
                 // from the first invocation of `def_with_name` for this type)
