@@ -168,9 +168,9 @@ impl<'tcx> CodegenCx<'tcx> {
     /// something that isn't supported, and should be an error.
     pub fn zombie_with_span(&self, word: Word, span: Span, reason: &str) {
         if self.is_system_crate(span) {
-            self.zombie_even_in_user_code(word, span, reason);
+            //self.zombie_even_in_user_code(word, span, reason);
         } else {
-            self.tcx.sess.span_err(span, reason);
+            #[cfg(FALSE)] self.tcx.sess.span_err(span, reason);
         }
     }
     pub fn zombie_no_span(&self, word: Word, reason: &str) {

@@ -56,6 +56,11 @@ pub enum SpirvType<'tcx> {
         /// Note: array count is ref to constant.
         count: SpirvValue,
     },
+    /// type itself doesn't have size information like [T]
+    /// it may fill up all space available when allocating
+    UnsizedArray {
+        element: Word,
+    },
     RuntimeArray {
         element: Word,
     },
@@ -190,6 +195,11 @@ impl SpirvType<'_> {
                     Decoration::ArrayStride,
                     iter::once(Operand::LiteralInt32(element_size as u32)),
                 );
+                result
+            },
+            Self::UnsizedArray { element } => {
+                let mut emit = cx.emit_global();
+                let result = emit.type_struct_id(id, []);
                 result
             }
             Self::RuntimeArray { element } => {
@@ -331,7 +341,7 @@ impl SpirvType<'_> {
     pub fn sizeof(&self, cx: &CodegenCx<'_>) -> Option<Size> {
         let result = match *self {
             // Types that have a dynamic size, or no concept of size at all.
-            Self::Void | Self::RuntimeArray { .. } | Self::Function { .. } => return None,
+            Self::Void | Self::UnsizedArray { .. } | Self::RuntimeArray { .. } | Self::Function { .. } => return None,
 
             Self::Bool => Size::from_bytes(1),
             Self::Integer(width, _) | Self::Float(width) => Size::from_bits(width),
@@ -342,7 +352,7 @@ impl SpirvType<'_> {
             Self::Matrix { element, count } => cx.lookup_type(element).sizeof(cx)? * count as u64,
             Self::Array { element, count } => {
                 cx.lookup_type(element).sizeof(cx)? * cx.builder.lookup_const_u64(count).unwrap()
-            }
+            },
             Self::Pointer { .. } => cx.tcx.data_layout.pointer_size,
             Self::Image { .. }
             | Self::AccelerationStructureKhr
@@ -371,6 +381,7 @@ impl SpirvType<'_> {
             )
             .expect("alignof: Vectors must have power-of-2 size"),
             Self::Array { element, .. }
+            | Self::UnsizedArray { element }
             | Self::RuntimeArray { element }
             | Self::Matrix { element, .. } => cx.lookup_type(element).alignof(cx),
             Self::Pointer { .. } => cx.tcx.data_layout.pointer_align.abi,
@@ -409,6 +420,7 @@ impl SpirvType<'_> {
             SpirvType::Vector { element, count } => SpirvType::Vector { element, count },
             SpirvType::Matrix { element, count } => SpirvType::Matrix { element, count },
             SpirvType::Array { element, count } => SpirvType::Array { element, count },
+            SpirvType::UnsizedArray { element } => SpirvType::UnsizedArray { element },
             SpirvType::RuntimeArray { element } => SpirvType::RuntimeArray { element },
             SpirvType::Pointer { pointee } => SpirvType::Pointer { pointee },
             SpirvType::Image {
@@ -549,6 +561,11 @@ impl fmt::Debug for SpirvTypePrinter<'_, '_> {
                         .lookup_const_u64(count)
                         .expect("Array type has invalid count value"),
                 )
+                .finish(),
+            SpirvType::UnsizedArray { element} => f
+                .debug_struct("Array")
+                .field("id", &self.id)
+                .field("element", &self.cx.debug_type(element))
                 .finish(),
             SpirvType::RuntimeArray { element } => f
                 .debug_struct("RuntimeArray")
@@ -702,6 +719,11 @@ impl SpirvTypePrinter<'_, '_> {
                 f.write_str("[")?;
                 ty(self.cx, stack, f, element)?;
                 write!(f, "; {len}]")
+            }
+            SpirvType::UnsizedArray { element } => {
+                f.write_str("[")?;
+                ty(self.cx, stack, f, element)?;
+                write!(f, "]")
             }
             SpirvType::RuntimeArray { element } => {
                 f.write_str("[")?;

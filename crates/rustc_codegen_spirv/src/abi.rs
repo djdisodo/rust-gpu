@@ -620,7 +620,7 @@ fn trans_aggregate<'tcx>(cx: &CodegenCx<'tcx>, span: Span, ty: TyAndLayout<'tcx>
                 let count = cx.constant_u32(span, ty.size.bytes() as u32);
                 SpirvType::Array {
                     element: byte,
-                    count,
+                    count: count,
                 }
                 .def(span, cx)
             }
@@ -631,10 +631,7 @@ fn trans_aggregate<'tcx>(cx: &CodegenCx<'tcx>, span: Span, ty: TyAndLayout<'tcx>
                 // There's a potential for this array to be sized, but the element to be unsized, e.g. `[[u8]; 5]`.
                 // However, I think rust disallows all these cases, so assert this here.
                 assert_eq!(count, 0);
-                SpirvType::RuntimeArray {
-                    element: element_type,
-                }
-                .def(span, cx)
+                SpirvType::UnsizedArray { element: element_type }.def(span, cx)
             } else if count == 0 {
                 // spir-v doesn't support zero-sized arrays
                 create_zst(cx, span, ty)

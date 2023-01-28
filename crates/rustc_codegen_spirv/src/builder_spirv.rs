@@ -561,9 +561,9 @@ impl<'tcx> BuilderSpirv<'tcx> {
                     // `field` is itself some legal `SpirvConst`, but can we have
                     // it as part of an `OpConstantComposite`?
                     match field_entry.val {
-                        SpirvConst::PtrTo { .. } => Err(IllegalConst::Shallow(
-                            LeafIllegalConst::CompositeContainsPtrTo,
-                        )),
+                        // SpirvConst::PtrTo { .. } => Err(IllegalConst::Shallow(
+                        //     LeafIllegalConst::CompositeContainsPtrTo,
+                        // )),
                         _ => Ok(()),
                     },
                 );

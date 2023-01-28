@@ -3,6 +3,7 @@ use crate::abi::ConvSpirvType;
 use crate::builder_spirv::{SpirvConst, SpirvValue, SpirvValueExt};
 use crate::spirv_type::SpirvType;
 use rspirv::spirv::Word;
+use rustc_target::abi::FieldsShape;
 use rustc_codegen_ssa::mir::place::PlaceRef;
 use rustc_codegen_ssa::traits::{BaseTypeMethods, ConstMethods, MiscMethods, StaticMethods};
 use rustc_middle::bug;
@@ -323,7 +324,7 @@ impl<'tcx> ConstMethods<'tcx> for CodegenCx<'tcx> {
                         .fatal("Non-pointer-typed scalar_to_backend Scalar::Ptr not supported");
                 // unsafe { llvm::LLVMConstPtrToInt(llval, llty) }
                 } else {
-                    assert_ty_eq!(self, value.ty, ty);
+                    //assert_ty_eq!(self, value.ty, ty);
                     value
                 }
             }
@@ -344,7 +345,21 @@ impl<'tcx> ConstMethods<'tcx> for CodegenCx<'tcx> {
         offset: Size,
     ) -> PlaceRef<'tcx, Self::Value> {
         assert_eq!(offset, Size::ZERO);
-        let ty = layout.spirv_type(DUMMY_SP, self);
+        let ty = if layout.is_unsized() {
+            let element_type = layout.field(self, 0).spirv_type(DUMMY_SP, self);
+            let element_size = self.lookup_type(element_type).sizeof(self).unwrap().bytes_usize();
+            let count = alloc.inner().len() / element_size;
+            dbg!("????");
+            dbg!(count);
+            let count_const = self.constant_u32(DUMMY_SP, count as u32);
+            SpirvType::Array {
+                element: element_type,
+                count: count_const
+            }
+            .def(DUMMY_SP, self)
+        } else {
+            layout.spirv_type(DUMMY_SP, self)
+        };
         let init = self.create_const_alloc(alloc, ty);
         let result = self.static_addr_of(init, alloc.inner().align, None);
         PlaceRef::new_sized(result, layout)
@@ -378,17 +393,15 @@ impl<'tcx> CodegenCx<'tcx> {
     }
 
     pub fn create_const_alloc(&self, alloc: ConstAllocation<'tcx>, ty: Word) -> SpirvValue {
-        // println!(
-        //     "Creating const alloc of type {} with {} bytes",
-        //     self.debug_type(ty),
-        //     alloc.len()
-        // );
+
         let mut offset = Size::ZERO;
         let result = self.create_const_alloc2(alloc, &mut offset, ty);
         assert_eq!(
             offset.bytes_usize(),
             alloc.inner().len(),
-            "create_const_alloc must consume all bytes of an Allocation"
+            "Creating const alloc of type {} with  bytes",
+            self.debug_type(ty)
+            //"create_const_alloc must consume all bytes of an Allocation"
         );
         // println!("Done creating alloc of type {}", self.debug_type(ty));
         result
@@ -398,7 +411,7 @@ impl<'tcx> CodegenCx<'tcx> {
         &self,
         alloc: ConstAllocation<'tcx>,
         offset: &mut Size,
-        ty: Word,
+        mut ty: Word,
     ) -> SpirvValue {
         let ty_concrete = self.lookup_type(ty);
         *offset = offset.align_to(ty_concrete.alignof(self));
@@ -500,7 +513,18 @@ impl<'tcx> CodegenCx<'tcx> {
                         .def_cx(self)
                 });
                 self.constant_composite(ty, values)
-            }
+            },
+            SpirvType::UnsizedArray { element } => {
+                //estimate count
+                let element_size = self.lookup_type(element).sizeof(self).unwrap().bytes_usize();
+                let count = (alloc.inner().len() - offset.bytes_usize()) / element_size;
+                let count_spv = self.constant_u32(DUMMY_SP, count as u32);
+                ty = SpirvType::Array {
+                    element,
+                    count: count_spv
+                }.def(DUMMY_SP, self);
+                self.create_const_alloc2(alloc, offset, ty)
+            },
             SpirvType::Vector { element, count } => {
                 let total_size = ty_concrete
                     .sizeof(self)

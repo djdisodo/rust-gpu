@@ -224,6 +224,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     iter::repeat(elem_pat).take(count),
                 )
                 .def(self)
+            },
+            SpirvType::UnsizedArray { .. } =>  {
+                self.fatal("cannot memset unsized array")
             }
             SpirvType::RuntimeArray { .. } => {
                 self.fatal("memset on runtime arrays not implemented yet")
@@ -282,6 +285,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         iter::repeat(elem_pat).take(count as usize),
                     )
                     .unwrap()
+            }
+            SpirvType::UnsizedArray { .. } => {
+                self.fatal("cannot memset unsized array")
             }
             SpirvType::RuntimeArray { .. } => {
                 self.fatal("memset on runtime arrays not implemented yet")
@@ -1570,6 +1576,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 .with_type(dest_ty)
         } else {
             // Defer the cast so that it has a chance to be avoided.
+
+            #[cfg(FALSE)]
             SpirvValue {
                 kind: SpirvValueKind::LogicalPtrCast {
                     original_ptr: val.def(self),
@@ -1577,7 +1585,8 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                     zombie_target_undef: self.undef(dest_ty).def(self),
                 },
                 ty: dest_ty,
-            }
+            };
+            self.emit().bitcast(dest_ty, None, val.def(self)).unwrap().with_type(dest_ty)
         }
     }
 
